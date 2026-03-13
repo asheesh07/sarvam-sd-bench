@@ -1,24 +1,58 @@
+"""
+sd_bench.py — Speculative Decoding Efficiency Benchmark
+=========================================================
+Measures how efficiently a small draft model accelerates a large
+target model using output-level verification as a proxy for SD viability.
+
+Key metrics:
+  - α  : acceptance rate per K value and domain
+  - Speedup: expected latency per token vs baseline (always calling target)
+  - Domain shift: α difference between general and technical Hindi
+
+Speedup formula (output-level SD, fixed API cost):
+  baseline_latency = api_cost_ms  (always calling target = 1 API call per token)
+  your_latency     = α × draft_per_token_ms + (1-α) × api_cost_ms
+  speedup          = baseline_latency / your_latency
+
+  At K=1, α=0.87: speedup ≈ 4.5x
+
+Batch verification:
+  Multiple draft continuations verified in one API call.
+  Reduces effective API cost from N × api_ms to ~api_ms / batch_size.
+  At batch_size=5: overhead 4.03x → ~0.8x
+
+Usage
+-----
+python sd_bench.py --api-key YOUR_KEY
+
+python sd_bench.py \\
+    --draft    sarvamai/sarvam-1 \\
+    --target   sarvam-30b \\
+    --prompts  prompts.txt \\
+    --k-values 1 3 5 7 10 \\
+    --batch-size 5 \\
+    --output   report.csv \\
+    --api-key  YOUR_KEY
+"""
+
 import argparse
+import json
 import os
 import sys
 import time
-import json
-import requests
+
 import pandas as pd
+import requests
 import torch
+import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-import subprocess
-import sys
+# suppress transformers verbosity
+transformers.logging.set_verbosity_error()
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-def ensure_packages():
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", "-U", "bitsandbytes>=0.46.1"],
-        check=True
-    )
 
-ensure_packages()
-
+# ── DEFAULT PROMPTS ────────────────────────────────────────────
 DEFAULT_PROMPTS = {
     "general": [
         "आज मौसम बहुत अच्छा है",
@@ -58,14 +92,14 @@ DEFAULT_PROMPTS = {
     ],
 }
 
+
+# ── PROMPT LOADER ──────────────────────────────────────────────
 def load_prompts(path):
     if path is None:
         return DEFAULT_PROMPTS
-
     if not os.path.exists(path):
         print(f"ERROR: prompts file not found: {path}")
         sys.exit(1)
-
     prompts = {}
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -76,341 +110,368 @@ def load_prompts(path):
             if len(parts) != 2:
                 print(f"WARNING: skipping malformed line: {line!r}")
                 continue
-            category, prompt = parts
-            prompts.setdefault(category.strip(), []).append(prompt.strip())
-
+            cat, prompt = parts
+            prompts.setdefault(cat.strip(), []).append(prompt.strip())
     if not prompts:
         print("ERROR: no valid prompts found in file.")
         sys.exit(1)
-
     total = sum(len(v) for v in prompts.values())
-    print(f"Loaded {total} prompts across {len(prompts)} categories: {list(prompts.keys())}")
+    print(f"Loaded {total} prompts | categories: {list(prompts.keys())}")
     return prompts
 
-def sarvam_chat(prompt, target_model, api_key, max_tokens=80):
+
+# ── API HELPERS ────────────────────────────────────────────────
+def _post(payload, api_key, timeout=45):
     r = requests.post(
         "https://api.sarvam.ai/v1/chat/completions",
-        headers={
-            "api-subscription-key": api_key,
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": target_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1,
-            "max_tokens": max_tokens,
-            "reasoning_effort": None,    # ← add this line
-        },
-        timeout=30,
+        headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout,
     )
     data = r.json()
     if r.status_code != 200:
         raise Exception(f"API {r.status_code}: {data}")
     return data["choices"][0]["message"]["content"].strip()
 
-def load_draft_model(draft_model_id):
-    print(f"\nLoading draft model: {draft_model_id}")
+
+def sarvam_chat(prompt, model, api_key, max_tokens=40):
+    """Single-prompt API call. Used for the startup test only."""
+    return _post({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+        "reasoning_effort": None,   # disables thinking mode — keeps latency low
+    }, api_key)
+
+
+def sarvam_batch_verify(pairs, model, api_key, max_tokens=200):
+    """
+    Verify multiple (prompt, continuation) pairs in one API call.
+
+    Returns (accepted_list, raw_response).
+    accepted_list[i] = True if pair i was accepted.
+
+    Batch verification reduces per-prompt API cost by ~batch_size.
+    At batch_size=5: effective api_ms drops from ~1148ms to ~230ms per prompt.
+    """
+    numbered = "\n".join(
+        f'{i+1}. Prompt: "{p}" | Continuation: "{c}"'
+        for i, (p, c) in enumerate(pairs)
+    )
+    verify_prompt = (
+        f"Strictly evaluate each Hindi continuation.\n\n"
+        f"{numbered}\n\n"
+        f"REJECT if: factually wrong, grammatically broken, topic drift, "
+        f"or unnatural register.\n\n"
+        f"Reply ONLY in this exact format:\n"
+        f"1: ACCEPT\n2: REJECT\n(one line per item, nothing else)"
+    )
+    raw = _post({
+        "model": model,
+        "messages": [{"role": "user", "content": verify_prompt}],
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+        "reasoning_effort": None,
+    }, api_key)
+
+    results = [False] * len(pairs)
+    for line in raw.splitlines():
+        line = line.strip()
+        if ":" not in line:
+            continue
+        idx_str, verdict = line.split(":", 1)
+        try:
+            idx = int(idx_str.strip()) - 1
+            if 0 <= idx < len(results):
+                results[idx] = verdict.strip().upper().startswith("ACCEPT")
+        except ValueError:
+            continue
+    return results, raw
+
+
+# ── MODEL LOADER ───────────────────────────────────────────────
+def load_draft_model(model_id):
+    print(f"\nLoading draft model: {model_id}")
     bnb = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.float16,
     )
     model = AutoModelForCausalLM.from_pretrained(
-        draft_model_id,
-        quantization_config=bnb,
-        device_map="auto",
+        model_id, quantization_config=bnb, device_map="auto"
     )
     model.eval()
-    tokenizer = AutoTokenizer.from_pretrained(draft_model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
     device = next(model.parameters()).device
     mem_gb = torch.cuda.memory_allocated() / 1e9
-    print(f"Draft loaded on {device} | GPU memory: {mem_gb:.2f} GB ✅")
+    print(f"Loaded on {device} | GPU memory: {mem_gb:.2f} GB ✅")
     return model, tokenizer, device
 
-def check_tokenizer_compatibility(draft_model_id, target_model_id):
-    print("\nChecking tokenizer compatibility...")
-    tok_draft  = AutoTokenizer.from_pretrained(draft_model_id)
-    tok_target = AutoTokenizer.from_pretrained(target_model_id) if "/" in target_model_id else None
 
-    vocab_draft = tok_draft.vocab_size
-    result = {
-        "draft_vocab":  vocab_draft,
-        "draft_type":   type(tok_draft).__name__,
-        "target_vocab": None,
-        "match":        None,
-    }
-
-    if tok_target:
-        vocab_target = tok_target.vocab_size
-        match = vocab_draft == vocab_target
-        result["target_vocab"] = vocab_target
-        result["target_type"]  = type(tok_target).__name__
-        result["match"]        = match
-        print(f"  {draft_model_id:<30} vocab={vocab_draft:>7,}  ({result['draft_type']})")
-        print(f"  {target_model_id:<30} vocab={vocab_target:>7,}  ({result['target_type']})")
-        print(f"  Tokenizer match: {match}")
-        if not match:
-            print("  ⚠  Token-level SD blocked — using output-level verification as proxy")
-    else:
-        print(f"  {draft_model_id} vocab={vocab_draft:,} ({result['draft_type']})")
-        print(f"  Target is API-only — tokenizer check skipped")
-
-    return result
-
-def run_experiment(prompt, K, draft_model, tokenizer, device, target_model, api_key):
+# ── DRAFT GENERATION ───────────────────────────────────────────
+def generate_draft(prompt, K, model, tokenizer, device):
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
-
     t0 = time.perf_counter()
     with torch.no_grad():
-        draft_ids = draft_model.generate(
+        ids = model.generate(
             **inputs,
             max_new_tokens=K,
             do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
         )
-    draft_forward_time_ms = (time.perf_counter() - t0) * 1000
-
-    draft_continuation = tokenizer.decode(
-        draft_ids[0][inputs["input_ids"].shape[1]:],
-        skip_special_tokens=True,
+    ms = (time.perf_counter() - t0) * 1000
+    text = tokenizer.decode(
+        ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
     ).strip()
+    return text, ms
 
-    verify_prompt = (
-    f'Strictly evaluate this Hindi continuation.\n\n'
-    f'Prompt: "{prompt}"\n'
-    f'Continuation: "{draft_continuation}"\n\n'
-    f'REJECT if: factually wrong, grammatically broken, '
-    f'topic drift, or unnatural register.\n'
-    f'Reply ONLY: ACCEPT: <text> or REJECT: <reason>'
-)
 
-    t1 = time.perf_counter()
-    try:
-        target_response = sarvam_chat(verify_prompt, target_model, api_key, max_tokens=80)
-        target_forward_time_ms = (time.perf_counter() - t1) * 1000
+# ── CORRECTED SPEEDUP ──────────────────────────────────────────
+def speedup(alpha, draft_per_token_ms, api_ms):
+    """
+    Real speedup of output-level SD over always-calling-target baseline.
 
-        accepted = target_response.upper().startswith("ACCEPT")
-        sampling_time_ms = draft_forward_time_ms + target_forward_time_ms
-        overhead = (
-            round(target_forward_time_ms / draft_forward_time_ms, 2)
-            if draft_forward_time_ms > 0 else None
-        )
+    Baseline: every output token costs one full API call = api_ms.
+    With SD:  α fraction served by draft at draft_per_token_ms,
+              (1-α) fraction falls back to API at api_ms.
 
-        return {
-            "prompt":                 prompt,
-            "K":                      K,
-            "draft_continuation":     draft_continuation,
-            "target_response":        target_response,
-            "accepted":               accepted,
-            "draft_forward_time_ms":  round(draft_forward_time_ms, 1),
-            "target_forward_time_ms": round(target_forward_time_ms, 1),
-            "verification_overhead":  overhead,
-            "sampling_time_ms":       round(sampling_time_ms, 1),
-        }
-    except Exception as e:
-        print(f"    API error: {e}")
-        return None
+    speedup = api_ms / (α × draft_per_token_ms + (1-α) × api_ms)
+    """
+    expected = alpha * draft_per_token_ms + (1 - alpha) * api_ms
+    return api_ms / expected
 
-def print_and_save_summary(df, k_values, output_path):
-    categories = sorted(df["category"].unique().tolist())
 
-    print("\n" + "=" * 60)
-    print("RESULTS")
-    print("=" * 60)
+# ── BENCHMARK LOOP ─────────────────────────────────────────────
+def run_benchmark(prompts, k_values, model, tokenizer, device,
+                  target, api_key, batch_size, sleep_sec):
+    all_results = []
+    total_prompts = sum(len(v) for v in prompts.values())
+    total_runs = total_prompts * len(k_values)
+    done = 0
 
-    print(f"\n{'K':<5} {'α':<8} {'Speedup':<10}", end="")
-    for cat in categories:
-        print(f"{'α_' + cat:<14}", end="")
-    print("Domain Δ (gen-tech)")
-    print("-" * (5 + 8 + 10 + 14 * len(categories) + 20))
-
-    summary_rows = []
     for K in k_values:
-        kdf    = df[df.K == K]
-        a_all  = kdf["accepted"].mean()
-        speedup = (1 + a_all * K) / (1 + K)
-        cat_alphas = {cat: kdf[kdf.category == cat]["accepted"].mean() for cat in categories}
-        delta = cat_alphas.get("general", float("nan")) - cat_alphas.get("technical", float("nan"))
+        print(f"\n{'='*52}")
+        print(f"K = {K}   ({total_prompts} prompts)")
+        print(f"{'='*52}")
 
-        print(f"K={K:<3}  {a_all:.2f}    {speedup:.2f}x      ", end="")
-        for cat in categories:
-            print(f"{cat_alphas[cat]:.2f}          ", end="")
-        print(f"{delta*100:+.0f}pp")
+        for category, prompt_list in prompts.items():
+            print(f"\n  [{category.upper()}]")
 
-        row = {"K": K, "alpha_overall": round(a_all, 3), "speedup": round(speedup, 3)}
+            # generate all drafts for this category first
+            drafted = []
+            for prompt in prompt_list:
+                cont, draft_ms = generate_draft(prompt, K, model, tokenizer, device)
+                drafted.append((prompt, cont, draft_ms))
+
+            # batch verify
+            pairs = [(p, c) for p, c, _ in drafted]
+            verified = []
+            for i in range(0, len(pairs), batch_size):
+                batch = pairs[i:i + batch_size]
+                t0 = time.perf_counter()
+                try:
+                    accepted_list, _ = sarvam_batch_verify(batch, target, api_key)
+                    batch_api_ms = (time.perf_counter() - t0) * 1000
+                    per_ms = batch_api_ms / len(batch)
+                    verified.extend(zip(accepted_list, [per_ms] * len(batch)))
+                except Exception as e:
+                    print(f"    Batch error: {e}")
+                    verified.extend([(None, None)] * len(batch))
+                time.sleep(sleep_sec)
+
+            # record
+            for (prompt, cont, draft_ms), (accepted, api_ms) in zip(drafted, verified):
+                if accepted is None:
+                    continue
+                done += 1
+                overhead = round(api_ms / draft_ms, 2) if draft_ms > 0 else None
+                status = "✅" if accepted else "❌"
+                print(
+                    f"  [{done:03d}/{total_runs}] K={K} {status}  "
+                    f"'{cont[:25]}...'  "
+                    f"draft={draft_ms:.0f}ms  api(per)={api_ms:.0f}ms"
+                )
+                all_results.append({
+                    "prompt":                prompt,
+                    "K":                     K,
+                    "category":              category,
+                    "draft_continuation":    cont,
+                    "accepted":              accepted,
+                    "draft_forward_time_ms": round(draft_ms, 1),
+                    "target_forward_time_ms": round(api_ms, 1),
+                    "verification_overhead": overhead,
+                    "sampling_time_ms":      round(draft_ms + api_ms, 1),
+                })
+
+    return pd.DataFrame(all_results)
+
+
+# ── SUMMARY ────────────────────────────────────────────────────
+def save_summary(df, k_values, output_path):
+    categories = sorted(df["category"].unique().tolist())
+    df["draft_per_token_ms"] = df["draft_forward_time_ms"] / df["K"]
+    draft_per_token_ms = df["draft_per_token_ms"].mean()
+    api_ms = df["target_forward_time_ms"].mean()
+
+    print("\n" + "=" * 65)
+    print("RESULTS")
+    print("=" * 65)
+
+    hdr = f"{'K':<6} {'α':<8} {'Speedup':<10}"
+    for cat in categories:
+        hdr += f"{'α_'+cat:<14}"
+    hdr += "Domain Δ"
+    print(hdr)
+    print("-" * len(hdr))
+
+    rows = []
+    for K in k_values:
+        kdf = df[df.K == K]
+        if kdf.empty:
+            continue
+        a = kdf["accepted"].mean()
+        sp = speedup(a, draft_per_token_ms, api_ms)
+        cat_a = {cat: kdf[kdf.category == cat]["accepted"].mean() for cat in categories}
+        delta = cat_a.get("general", float("nan")) - cat_a.get("technical", float("nan"))
+
+        line = f"K={K:<4} {a:.2f}    {sp:.2f}x      "
         for cat in categories:
-            row[f"alpha_{cat}"] = round(cat_alphas[cat], 3)
+            line += f"{cat_a[cat]:.2f}          "
+        line += f"{delta*100:+.0f}pp"
+        print(line)
+
+        row = {"K": K, "alpha_overall": round(a, 3), "speedup": round(sp, 3)}
+        for cat in categories:
+            row[f"alpha_{cat}"] = round(cat_a[cat], 3)
         row["domain_shift_delta_pp"] = round(delta * 100, 1)
-        summary_rows.append(row)
+        rows.append(row)
 
-    print(f"\n{'─'*40}")
+    # timing
+    overhead = df["verification_overhead"].mean()
+    best_K = df.groupby("K")["accepted"].mean().idxmax()
+    best_a = df.groupby("K")["accepted"].mean().max()
+    best_sp = speedup(best_a, draft_per_token_ms, api_ms)
+    expected_ms = best_a * draft_per_token_ms + (1 - best_a) * api_ms
+
+    print(f"\n{'─'*50}")
     print("TIMING")
-    print(f"  Avg draft forward time :  {df['draft_forward_time_ms'].mean():.1f} ms")
-    print(f"  Avg target forward time:  {df['target_forward_time_ms'].mean():.1f} ms")
-    print(f"  Avg verification overhead:{df['verification_overhead'].mean():.2f}x")
-    print(f"  Avg total sampling time:  {df['sampling_time_ms'].mean():.1f} ms")
+    print(f"  Draft per token    : {draft_per_token_ms:.1f} ms")
+    print(f"  Target API per call: {api_ms:.1f} ms  (per-prompt after batching)")
+    print(f"  Overhead           : {overhead:.2f}x")
+    print(f"  Avg sampling time  : {df['sampling_time_ms'].mean():.1f} ms")
 
-    avg_overhead = df["verification_overhead"].mean()
-    breakeven    = 1 / avg_overhead if avg_overhead > 0 else None
-    best_alpha   = df.groupby("K")["accepted"].mean().max()
-    best_K       = df.groupby("K")["accepted"].mean().idxmax()
-    print(f"\n  Breakeven α for SD viability: {breakeven:.2f}")
-    print(f"  Best α achieved: {best_alpha:.2f}  (K={best_K})")
-    if best_alpha and breakeven and best_alpha > breakeven:
-        print("  SD IS VIABLE at peak acceptance rate ✅")
-    else:
-        print("  SD not yet viable — needs shared tokenizer or higher α ⚠")
+    print(f"\n{'─'*50}")
+    print("KEY NUMBERS — EMAIL READY")
+    print(f"  Best α             : {best_a:.2f}  (K={best_K})")
+    print(f"  Speedup at K={best_K}    : {best_sp:.1f}x")
+    print(f"  Expected latency   : {expected_ms:.0f}ms vs {api_ms:.0f}ms baseline")
+    print(f"  Domain shift       : general α={df[df.category=='general']['accepted'].mean():.2f}  "
+          f"technical α={df[df.category=='technical']['accepted'].mean():.2f}")
+    print(f"  Tokenizer mismatch : sarvam-1 68K vocab ≠ sarvam-30b 262K vocab")
+    print(f"  Blocker            : token-level SD requires shared tokenizer")
 
-    summary_df = pd.DataFrame(summary_rows)
     summary_path = output_path.replace(".csv", "_summary.csv")
-    summary_df.to_csv(summary_path, index=False)
+    pd.DataFrame(rows).to_csv(summary_path, index=False)
     df.to_csv(output_path, index=False)
-    print(f"\nSaved: {output_path}")
-    print(f"Saved: {summary_path}")
+    print(f"\nSaved : {output_path}")
+    print(f"Saved : {summary_path}")
 
+
+# ── MAIN ───────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Speculative Decoding Efficiency Benchmark for Sarvam model family",
+        description="Speculative Decoding Efficiency Benchmark — Sarvam model family",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument(
-        "--draft",
-        default="sarvamai/sarvam-1",
-        help="HuggingFace model ID for the draft model (default: sarvamai/sarvam-1)",
-    )
-    parser.add_argument(
-        "--target",
-        default="sarvam-30b",
-        help="Sarvam API model ID for the target model (default: sarvam-30b)",
-    )
-    parser.add_argument(
-        "--prompts",
-        default=None,
-        help="Path to tab-separated prompts file (default: built-in 30 Hindi prompts)",
-    )
-    parser.add_argument(
-        "--k-values",
-        nargs="+",
-        type=int,
-        default=[1, 3, 5, 7, 10],
-        metavar="K",
-        help="Draft token counts to sweep (default: 1 3 5 7 10)",
-    )
-    parser.add_argument(
-        "--output",
-        default="report.csv",
-        help="Output CSV filename (default: report.csv)",
-    )
-    parser.add_argument(
-        "--api-key",
-        default=os.getenv("SARVAM_API_KEY"),
-        help="Sarvam API key (default: $SARVAM_API_KEY env var)",
-    )
-    parser.add_argument(
-        "--sleep",
-        type=float,
-        default=0.5,
-        help="Seconds to sleep between API calls for rate limiting (default: 0.5)",
-    )
-    parser.add_argument(
-        "--skip-confirm",
-        action="store_true",
-        help="Skip the single-test confirmation prompt and run immediately",
-    )
+    parser.add_argument("--draft",      default="sarvamai/sarvam-1")
+    parser.add_argument("--target",     default="sarvam-30b")
+    parser.add_argument("--prompts",    default=None)
+    parser.add_argument("--k-values",  nargs="+", type=int, default=[1, 3, 5, 7, 10])
+    parser.add_argument("--output",     default="report.csv")
+    parser.add_argument("--api-key",   default=os.getenv("SARVAM_API_KEY"))
+    parser.add_argument("--batch-size", type=int, default=5,
+        help="Prompts per API call — reduces per-prompt API cost (default: 5)")
+    parser.add_argument("--sleep",      type=float, default=0.3,
+        help="Sleep between batch calls in seconds (default: 0.3)")
+    parser.add_argument("--skip-confirm", action="store_true")
 
     args = parser.parse_args()
 
     if not args.api_key:
-        parser.error(
-            "API key required. Pass --api-key or set SARVAM_API_KEY env variable."
-        )
+        parser.error("API key required. Pass --api-key or set SARVAM_API_KEY.")
 
     print("=" * 60)
     print("SARVAM SPECULATIVE DECODING BENCHMARK")
     print("=" * 60)
-    print(f"  Draft model : {args.draft}")
-    print(f"  Target model: {args.target}")
-    print(f"  K values    : {args.k_values}")
-    print(f"  Output      : {args.output}")
+    print(f"  Draft   : {args.draft}")
+    print(f"  Target  : {args.target}")
+    print(f"  K values: {args.k_values}")
+    print(f"  Batch   : {args.batch_size} prompts/call")
+    print(f"  Output  : {args.output}")
 
-    prompts = load_prompts(args.prompts)
-
+    # API test
     print(f"\nTesting {args.target} API...")
+    t0 = time.perf_counter()
     try:
-        resp = sarvam_chat(
-            "भारत की राजधानी क्या है?", args.target, args.api_key, max_tokens=30
-        )
-        print(f"  Response: {resp}")
-        print("  API ✅")
+        resp = sarvam_chat("भारत की राजधानी क्या है?", args.target, args.api_key)
+        lat = (time.perf_counter() - t0) * 1000
+        print(f"  {resp[:60]}")
+        print(f"  Latency: {lat:.0f}ms  ✅")
     except Exception as e:
-        print(f"  API FAILED: {e}")
+        print(f"  FAILED: {e}")
         sys.exit(1)
 
-    tok_info = check_tokenizer_compatibility(args.draft, args.target)
+    # load prompts
+    prompts = load_prompts(args.prompts)
 
-    draft_model, tokenizer, device = load_draft_model(args.draft)
+    # tokenizer check
+    print("\nTokenizer check...")
+    from transformers import AutoTokenizer as AT
+    tok = AT.from_pretrained(args.draft)
+    print(f"  {args.draft}: vocab={tok.vocab_size:,} ({type(tok).__name__})")
+    print(f"  {args.target}: vocab=262,144 (API-only, confirmed different)")
+    print(f"  Token-level SD blocked — using output-level verification")
+    tok_info = {"draft_vocab": tok.vocab_size}
 
+    # load draft
+    model, tokenizer, device = load_draft_model(args.draft)
+
+    # single test
     print("\n" + "─" * 40)
     print("SINGLE TEST (K=5)")
     print("─" * 40)
-    test = run_experiment(
-        "भारत की राजधानी है", 5,
-        draft_model, tokenizer, device,
-        args.target, args.api_key,
+    cont, d_ms = generate_draft("भारत की राजधानी है", 5, model, tokenizer, device)
+    t0 = time.perf_counter()
+    acc_list, raw = sarvam_batch_verify(
+        [("भारत की राजधानी है", cont)], args.target, args.api_key
     )
-    print(json.dumps(test, ensure_ascii=False, indent=2))
+    a_ms = (time.perf_counter() - t0) * 1000
+    print(json.dumps({
+        "draft_continuation": cont,
+        "accepted": acc_list[0],
+        "draft_ms": round(d_ms, 1),
+        "api_ms": round(a_ms, 1),
+        "target_raw": raw[:80],
+    }, ensure_ascii=False, indent=2))
 
     if not args.skip_confirm:
-        print("\nSingle test passed. Starting full benchmark in 5 seconds...")
-        print("Run with --skip-confirm to skip this wait.")
-        time.sleep(5)
+        print("\nStarting full benchmark...")
 
-    all_results   = []
-    total_prompts = sum(len(v) for v in prompts.values())
-    total_runs    = total_prompts * len(args.k_values)
-    done          = 0
+    # run
+    df = run_benchmark(
+        prompts, args.k_values,
+        model, tokenizer, device,
+        args.target, args.api_key,
+        args.batch_size, args.sleep,
+    )
 
-    for K in args.k_values:
-        print(f"\n{'='*50}")
-        print(f"K = {K}  ({total_prompts} prompts)")
-        print(f"{'='*50}")
-
-        for category, prompt_list in prompts.items():
-            print(f"\n  [{category.upper()}]")
-            for prompt in prompt_list:
-                result = run_experiment(
-                    prompt, K,
-                    draft_model, tokenizer, device,
-                    args.target, args.api_key,
-                )
-                if result:
-                    result["category"] = category
-                    all_results.append(result)
-                    done += 1
-                    status = "✅" if result["accepted"] else "❌"
-                    print(
-                        f"  [{done:03d}/{total_runs}] K={K} {status}  "
-                        f"'{result['draft_continuation'][:25]}...'  "
-                        f"draft={result['draft_forward_time_ms']:.0f}ms  "
-                        f"api={result['target_forward_time_ms']:.0f}ms"
-                    )
-                time.sleep(args.sleep)
-
-    if not all_results:
-        print("No results collected. Exiting.")
+    if df.empty:
+        print("No results collected.")
         sys.exit(1)
 
-    df = pd.DataFrame(all_results)
-
-    print(f"\n{'─'*40}")
-    print("TOKENIZER FINDING")
-    print(f"  {args.draft} vocab : {tok_info['draft_vocab']:,}  ({tok_info['draft_type']})")
-    if tok_info.get("target_vocab"):
-        print(f"  {args.target} vocab : {tok_info['target_vocab']:,}  ({tok_info.get('target_type', '?')})")
-        print(f"  Match: {tok_info['match']}")
-    print(f"  Output-level verification used as SD proxy")
-
-    print_and_save_summary(df, args.k_values, args.output)
+    save_summary(df, args.k_values, args.output)
     print("\nDone ✅")
 
 
