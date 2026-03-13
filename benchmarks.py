@@ -360,11 +360,9 @@ def main():
     print(json.dumps(test, ensure_ascii=False, indent=2))
 
     if not args.skip_confirm:
-        try:
-            input("\nPress Enter to run full benchmark, Ctrl+C to abort...")
-        except KeyboardInterrupt:
-            print("\nAborted.")
-            sys.exit(0)
+        print("\nSingle test passed. Starting full benchmark in 5 seconds...")
+        print("Run with --skip-confirm to skip this wait.")
+        time.sleep(5)
 
     all_results   = []
     total_prompts = sum(len(v) for v in prompts.values())
