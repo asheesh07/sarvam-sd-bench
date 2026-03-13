@@ -1,40 +1,3 @@
-"""
-sd_bench.py — Speculative Decoding Efficiency Benchmark
-=========================================================
-Measures how efficiently a small draft model accelerates a large
-target model using output-level verification as a proxy for SD viability.
-
-Key metrics:
-  - α  : acceptance rate per K value and domain
-  - Speedup: expected latency per token vs baseline (always calling target)
-  - Domain shift: α difference between general and technical Hindi
-
-Speedup formula (output-level SD, fixed API cost):
-  baseline_latency = api_cost_ms  (always calling target = 1 API call per token)
-  your_latency     = α × draft_per_token_ms + (1-α) × api_cost_ms
-  speedup          = baseline_latency / your_latency
-
-  At K=1, α=0.87: speedup ≈ 4.5x
-
-Batch verification:
-  Multiple draft continuations verified in one API call.
-  Reduces effective API cost from N × api_ms to ~api_ms / batch_size.
-  At batch_size=5: overhead 4.03x → ~0.8x
-
-Usage
------
-python sd_bench.py --api-key YOUR_KEY
-
-python sd_bench.py \\
-    --draft    sarvamai/sarvam-1 \\
-    --target   sarvam-30b \\
-    --prompts  prompts.txt \\
-    --k-values 1 3 5 7 10 \\
-    --batch-size 5 \\
-    --output   report.csv \\
-    --api-key  YOUR_KEY
-"""
-
 import argparse
 import json
 import os
@@ -47,12 +10,9 @@ import torch
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-# suppress transformers verbosity
 transformers.logging.set_verbosity_error()
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-
-# ── DEFAULT PROMPTS ────────────────────────────────────────────
 DEFAULT_PROMPTS = {
     "general": [
         "आज मौसम बहुत अच्छा है",
@@ -92,8 +52,6 @@ DEFAULT_PROMPTS = {
     ],
 }
 
-
-# ── PROMPT LOADER ──────────────────────────────────────────────
 def load_prompts(path):
     if path is None:
         return DEFAULT_PROMPTS
@@ -119,8 +77,6 @@ def load_prompts(path):
     print(f"Loaded {total} prompts | categories: {list(prompts.keys())}")
     return prompts
 
-
-# ── API HELPERS ────────────────────────────────────────────────
 def _post(payload, api_key, timeout=45):
     r = requests.post(
         "https://api.sarvam.ai/v1/chat/completions",
@@ -141,7 +97,7 @@ def sarvam_chat(prompt, model, api_key, max_tokens=40):
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
         "max_tokens": max_tokens,
-        "reasoning_effort": None,   # disables thinking mode — keeps latency low
+        "reasoning_effort": None,  
     }, api_key)
 
 
@@ -172,7 +128,6 @@ def sarvam_batch_verify(pairs, model, api_key, max_tokens=200):
     "reasoning_effort": None,
 }, api_key)
 
-    # default ACCEPT — reject only on explicit REJECT
     results = [True] * len(pairs)
     for line in raw.splitlines():
         line = line.strip()
@@ -187,8 +142,6 @@ def sarvam_batch_verify(pairs, model, api_key, max_tokens=200):
             continue
     return results, raw
 
-
-# ── MODEL LOADER ───────────────────────────────────────────────
 def load_draft_model(model_id):
     print(f"\nLoading draft model: {model_id}")
     bnb = BitsAndBytesConfig(
@@ -206,8 +159,6 @@ def load_draft_model(model_id):
     print(f"Loaded on {device} | GPU memory: {mem_gb:.2f} GB ✅")
     return model, tokenizer, device
 
-
-# ── DRAFT GENERATION ───────────────────────────────────────────
 def generate_draft(prompt, K, model, tokenizer, device):
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     t0 = time.perf_counter()
@@ -224,23 +175,10 @@ def generate_draft(prompt, K, model, tokenizer, device):
     ).strip()
     return text, ms
 
-
-# ── CORRECTED SPEEDUP ──────────────────────────────────────────
 def speedup(alpha, draft_per_token_ms, api_ms):
-    """
-    Real speedup of output-level SD over always-calling-target baseline.
-
-    Baseline: every output token costs one full API call = api_ms.
-    With SD:  α fraction served by draft at draft_per_token_ms,
-              (1-α) fraction falls back to API at api_ms.
-
-    speedup = api_ms / (α × draft_per_token_ms + (1-α) × api_ms)
-    """
     expected = alpha * draft_per_token_ms + (1 - alpha) * api_ms
     return api_ms / expected
 
-
-# ── BENCHMARK LOOP ─────────────────────────────────────────────
 def run_benchmark(prompts, k_values, model, tokenizer, device,
                   target, api_key, batch_size, sleep_sec):
     all_results = []
@@ -255,14 +193,11 @@ def run_benchmark(prompts, k_values, model, tokenizer, device,
 
         for category, prompt_list in prompts.items():
             print(f"\n  [{category.upper()}]")
-
-            # generate all drafts for this category first
             drafted = []
             for prompt in prompt_list:
                 cont, draft_ms = generate_draft(prompt, K, model, tokenizer, device)
                 drafted.append((prompt, cont, draft_ms))
 
-            # batch verify
             pairs = [(p, c) for p, c, _ in drafted]
             verified = []
             for i in range(0, len(pairs), batch_size):
@@ -278,7 +213,6 @@ def run_benchmark(prompts, k_values, model, tokenizer, device,
                     verified.extend([(None, None)] * len(batch))
                 time.sleep(sleep_sec)
 
-            # record
             for (prompt, cont, draft_ms), (accepted, api_ms) in zip(drafted, verified):
                 if accepted is None:
                     continue
@@ -304,8 +238,6 @@ def run_benchmark(prompts, k_values, model, tokenizer, device,
 
     return pd.DataFrame(all_results)
 
-
-# ── SUMMARY ────────────────────────────────────────────────────
 def save_summary(df, k_values, output_path):
     categories = sorted(df["category"].unique().tolist())
     df["draft_per_token_ms"] = df["draft_forward_time_ms"] / df["K"]
@@ -345,7 +277,6 @@ def save_summary(df, k_values, output_path):
         row["domain_shift_delta_pp"] = round(delta * 100, 1)
         rows.append(row)
 
-    # timing
     overhead = df["verification_overhead"].mean()
     best_K = df.groupby("K")["accepted"].mean().idxmax()
     best_a = df.groupby("K")["accepted"].mean().max()
@@ -375,8 +306,6 @@ def save_summary(df, k_values, output_path):
     print(f"\nSaved : {output_path}")
     print(f"Saved : {summary_path}")
 
-
-# ── MAIN ───────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
         description="Speculative Decoding Efficiency Benchmark — Sarvam model family",
@@ -408,8 +337,6 @@ def main():
     print(f"  K values: {args.k_values}")
     print(f"  Batch   : {args.batch_size} prompts/call")
     print(f"  Output  : {args.output}")
-
-    # API test
     print(f"\nTesting {args.target} API...")
     t0 = time.perf_counter()
     try:
@@ -420,11 +347,8 @@ def main():
     except Exception as e:
         print(f"  FAILED: {e}")
         sys.exit(1)
-
-    # load prompts
     prompts = load_prompts(args.prompts)
 
-    # tokenizer check
     print("\nTokenizer check...")
     from transformers import AutoTokenizer as AT
     tok = AT.from_pretrained(args.draft)
@@ -433,10 +357,7 @@ def main():
     print(f"  Token-level SD blocked — using output-level verification")
     tok_info = {"draft_vocab": tok.vocab_size}
 
-    # load draft
     model, tokenizer, device = load_draft_model(args.draft)
-
-    # single test
     print("\n" + "─" * 40)
     print("SINGLE TEST (K=5)")
     print("─" * 40)
@@ -457,7 +378,6 @@ def main():
     if not args.skip_confirm:
         print("\nStarting full benchmark...")
 
-    # run
     df = run_benchmark(
         prompts, args.k_values,
         model, tokenizer, device,
@@ -471,7 +391,6 @@ def main():
 
     save_summary(df, args.k_values, args.output)
     print("\nDone ✅")
-
 
 if __name__ == "__main__":
     main()
