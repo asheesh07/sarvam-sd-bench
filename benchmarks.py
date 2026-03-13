@@ -8,6 +8,17 @@ import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+import subprocess
+import sys
+
+def ensure_packages():
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "-U", "bitsandbytes>=0.46.1"],
+        check=True
+    )
+
+ensure_packages()
+
 DEFAULT_PROMPTS = {
     "general": [
         "आज मौसम बहुत अच्छा है",
