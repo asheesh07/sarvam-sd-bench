@@ -1,7 +1,5 @@
 # sarvam-sd-bench
 
-# sarvam-sd-bench
-
 Speculative decoding benchmark: Sarvam-1 draft → Sarvam-30B target.
 
 ---
@@ -12,7 +10,7 @@ Speculative decoding benchmark: Sarvam-1 draft → Sarvam-30B target.
 Draft  : Sarvam-1 (3B, 4-bit quantized)
 Target : Sarvam-30B (via API)
 Prompts: 150 Hindi prompts (30 × 5 K values)
-GPU    : Kaggle T4 (16GB)
+GPU    : Kaggle p100 (16GB)
 ```
 
 **Best at K=1**
@@ -85,7 +83,7 @@ Worth investigating with a larger prompt set.
 ## Timing
 
 ```
-Draft inference (Sarvam-1, 4-bit, T4) : 88.8ms per token
+Draft inference (Sarvam-1, 4-bit, p100) : 88.8ms per token
 Target API (Sarvam-30B, batch=5)      : 227.8ms per prompt
 Verification overhead                  : 0.81×
 Avg total sampling time                : 648ms
@@ -101,11 +99,11 @@ Without batching, speedup stays below 1×.
 
 ```
 Draft : Sarvam-1 (3B, 4-bit BitsAndBytes)
-GPU   : Kaggle T4 (16GB VRAM)
+GPU   : Kaggle p100 (16GB VRAM)
 VRAM  : 1.73GB after loading draft
 ```
 
-Sarvam-30B needs ~17GB in 4-bit — doesn't fit on a T4.
+Sarvam-30B needs ~17GB in 4-bit — doesn't fit on a p100.
 So the target runs via the Sarvam API (`sarvam-30b` endpoint).
 That's also why output-level verification is used instead of token-level.
 
