@@ -1,0 +1,32 @@
+# categories: general, technical, mixed (or any custom label)
+
+general	आज मौसम बहुत अच्छा है
+general	मुझे चाय बहुत पसंद है
+general	भारत एक विविधताओं से भरा देश है
+general	मेरे परिवार में चार लोग हैं
+general	हम कल बाजार जाएंगे
+general	खाना बहुत स्वादिष्ट था
+general	वह एक अच्छा इंसान है
+general	आज स्कूल में छुट्टी है
+general	मुझे किताबें पढ़ना पसंद है
+general	बच्चे मैदान में खेल रहे हैं
+technical	मशीन लर्निंग एक ऐसी तकनीक है जो
+technical	न्यूरल नेटवर्क में बैकप्रोपगेशन का उपयोग
+technical	डेटाबेस में इंडेक्स बनाने से क्वेरी
+technical	एपीआई एंडपॉइंट को कॉल करने के लिए
+technical	क्लाउड कंप्यूटिंग में वर्चुअलाइजेशन का अर्थ
+technical	गहरी शिक्षा मॉडल को प्रशिक्षित करने के लिए
+technical	टोकनाइज़ेशन प्रक्रिया में शब्दों को
+technical	ट्रांसफॉर्मर आर्किटेक्चर में अटेंशन मैकेनिज्म
+technical	सर्वर पर लोड बैलेंसिंग करने से
+technical	कुबेरनेटेस में पॉड डिप्लॉयमेंट की प्रक्रिया
+mixed	मैंने आज Python में एक नया script लिखा
+mixed	इस model की accuracy बहुत अच्छी है
+mixed	Data preprocessing के बाद results
+mixed	इस API को integrate करना आसान है
+mixed	Machine learning के बिना modern AI
+mixed	हमारा server आज down हो गया
+mixed	Database की query optimize करनी होगी
+mixed	इस feature को production में deploy करें
+mixed	Testing के दौरान बहुत bugs मिले
+mixed	Cloud पर migrate करने से cost कम होगी
