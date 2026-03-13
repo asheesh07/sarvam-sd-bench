@@ -164,7 +164,13 @@ def sarvam_batch_verify(pairs, model, api_key, max_tokens=200):
         f"Output ALL {len(pairs)} lines."
     )
 
-    raw = _post({...}, api_key)
+    raw = _post({
+    "model": model,
+    "messages": [{"role": "user", "content": verify_prompt}],
+    "temperature": 0.1,
+    "max_tokens": max_tokens,
+    "reasoning_effort": None,
+}, api_key)
 
     # default ACCEPT — reject only on explicit REJECT
     results = [True] * len(pairs)
