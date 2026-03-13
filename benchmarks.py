@@ -1,38 +1,3 @@
-"""
-sd_bench.py — Speculative Decoding Efficiency Benchmark
-=========================================================
-Measures how efficiently a small draft model accelerates a large
-target model using output-level verification as a proxy for SD viability.
-
-Designed for inference engineers at Sarvam AI to benchmark any
-draft + target model pair on their own prompt sets.
-
-Usage
------
-# minimal — uses all defaults
-python sd_bench.py --api-key YOUR_KEY
-
-# full control
-python sd_bench.py \
-    --draft    sarvamai/sarvam-1 \
-    --target   sarvam-30b \
-    --prompts  prompts.txt \
-    --k-values 1 3 5 7 10 \
-    --output   report.csv \
-    --api-key  YOUR_KEY
-
-Prompt file format (tab-separated)
-------------------------------------
-general     आज मौसम बहुत अच्छा है
-technical   ट्रांसफॉर्मर आर्किटेक्चर में अटेंशन मैकेनिज्म
-mixed       इस API को integrate करना आसान है
-
-Output files
-------------
-  <output>.csv        — raw per-prompt results
-  <output>_summary.csv — per-K aggregated metrics
-"""
-
 import argparse
 import os
 import sys
@@ -43,8 +8,6 @@ import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-
-# ── DEFAULT PROMPTS ────────────────────────────────────────────
 DEFAULT_PROMPTS = {
     "general": [
         "आज मौसम बहुत अच्छा है",
@@ -84,14 +47,7 @@ DEFAULT_PROMPTS = {
     ],
 }
 
-
-# ── PROMPT LOADER ──────────────────────────────────────────────
 def load_prompts(path):
-    """
-    Load prompts from a tab-separated file.
-    Format: <category>\t<prompt>
-    Falls back to DEFAULT_PROMPTS if path is None.
-    """
     if path is None:
         return DEFAULT_PROMPTS
 
@@ -120,8 +76,6 @@ def load_prompts(path):
     print(f"Loaded {total} prompts across {len(prompts)} categories: {list(prompts.keys())}")
     return prompts
 
-
-# ── API CALL ───────────────────────────────────────────────────
 def sarvam_chat(prompt, target_model, api_key, max_tokens=80):
     r = requests.post(
         "https://api.sarvam.ai/v1/chat/completions",
@@ -134,6 +88,7 @@ def sarvam_chat(prompt, target_model, api_key, max_tokens=80):
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
             "max_tokens": max_tokens,
+            "reasoning_effort": None,    # ← add this line
         },
         timeout=30,
     )
@@ -142,8 +97,6 @@ def sarvam_chat(prompt, target_model, api_key, max_tokens=80):
         raise Exception(f"API {r.status_code}: {data}")
     return data["choices"][0]["message"]["content"].strip()
 
-
-# ── MODEL LOADER ───────────────────────────────────────────────
 def load_draft_model(draft_model_id):
     print(f"\nLoading draft model: {draft_model_id}")
     bnb = BitsAndBytesConfig(
@@ -163,8 +116,6 @@ def load_draft_model(draft_model_id):
     print(f"Draft loaded on {device} | GPU memory: {mem_gb:.2f} GB ✅")
     return model, tokenizer, device
 
-
-# ── TOKENIZER COMPATIBILITY CHECK ─────────────────────────────
 def check_tokenizer_compatibility(draft_model_id, target_model_id):
     print("\nChecking tokenizer compatibility...")
     tok_draft  = AutoTokenizer.from_pretrained(draft_model_id)
@@ -195,10 +146,7 @@ def check_tokenizer_compatibility(draft_model_id, target_model_id):
 
     return result
 
-
-# ── CORE EXPERIMENT ────────────────────────────────────────────
 def run_experiment(prompt, K, draft_model, tokenizer, device, target_model, api_key):
-    # Step 1 — draft generates K tokens locally
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
     t0 = time.perf_counter()
@@ -215,7 +163,6 @@ def run_experiment(prompt, K, draft_model, tokenizer, device, target_model, api_
         skip_special_tokens=True,
     ).strip()
 
-    # Step 2 — target verifies via API
     verify_prompt = (
         f'Hindi text verification task.\n\n'
         f'Original: "{prompt}"\n'
@@ -251,8 +198,6 @@ def run_experiment(prompt, K, draft_model, tokenizer, device, target_model, api_
         print(f"    API error: {e}")
         return None
 
-
-# ── SUMMARY PRINTER ────────────────────────────────────────────
 def print_and_save_summary(df, k_values, output_path):
     categories = sorted(df["category"].unique().tolist())
 
@@ -260,7 +205,6 @@ def print_and_save_summary(df, k_values, output_path):
     print("RESULTS")
     print("=" * 60)
 
-    # per-K table
     print(f"\n{'K':<5} {'α':<8} {'Speedup':<10}", end="")
     for cat in categories:
         print(f"{'α_' + cat:<14}", end="")
@@ -286,7 +230,6 @@ def print_and_save_summary(df, k_values, output_path):
         row["domain_shift_delta_pp"] = round(delta * 100, 1)
         summary_rows.append(row)
 
-    # timing
     print(f"\n{'─'*40}")
     print("TIMING")
     print(f"  Avg draft forward time :  {df['draft_forward_time_ms'].mean():.1f} ms")
@@ -305,7 +248,6 @@ def print_and_save_summary(df, k_values, output_path):
     else:
         print("  SD not yet viable — needs shared tokenizer or higher α ⚠")
 
-    # save
     summary_df = pd.DataFrame(summary_rows)
     summary_path = output_path.replace(".csv", "_summary.csv")
     summary_df.to_csv(summary_path, index=False)
@@ -313,8 +255,6 @@ def print_and_save_summary(df, k_values, output_path):
     print(f"\nSaved: {output_path}")
     print(f"Saved: {summary_path}")
 
-
-# ── MAIN ───────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
         description="Speculative Decoding Efficiency Benchmark for Sarvam model family",
@@ -368,7 +308,6 @@ def main():
 
     args = parser.parse_args()
 
-    # ── validate ───────────────────────────────────────────────
     if not args.api_key:
         parser.error(
             "API key required. Pass --api-key or set SARVAM_API_KEY env variable."
@@ -382,10 +321,8 @@ def main():
     print(f"  K values    : {args.k_values}")
     print(f"  Output      : {args.output}")
 
-    # ── load prompts ───────────────────────────────────────────
     prompts = load_prompts(args.prompts)
 
-    # ── test API ───────────────────────────────────────────────
     print(f"\nTesting {args.target} API...")
     try:
         resp = sarvam_chat(
@@ -397,13 +334,10 @@ def main():
         print(f"  API FAILED: {e}")
         sys.exit(1)
 
-    # ── tokenizer check ────────────────────────────────────────
     tok_info = check_tokenizer_compatibility(args.draft, args.target)
 
-    # ── load draft ─────────────────────────────────────────────
     draft_model, tokenizer, device = load_draft_model(args.draft)
 
-    # ── single test ────────────────────────────────────────────
     print("\n" + "─" * 40)
     print("SINGLE TEST (K=5)")
     print("─" * 40)
@@ -421,7 +355,6 @@ def main():
             print("\nAborted.")
             sys.exit(0)
 
-    # ── full benchmark ─────────────────────────────────────────
     all_results   = []
     total_prompts = sum(len(v) for v in prompts.values())
     total_runs    = total_prompts * len(args.k_values)
@@ -453,14 +386,12 @@ def main():
                     )
                 time.sleep(args.sleep)
 
-    # ── save and summarize ─────────────────────────────────────
     if not all_results:
         print("No results collected. Exiting.")
         sys.exit(1)
 
     df = pd.DataFrame(all_results)
 
-    # append tokenizer finding to summary
     print(f"\n{'─'*40}")
     print("TOKENIZER FINDING")
     print(f"  {args.draft} vocab : {tok_info['draft_vocab']:,}  ({tok_info['draft_type']})")
