@@ -175,12 +175,13 @@ def run_experiment(prompt, K, draft_model, tokenizer, device, target_model, api_
     ).strip()
 
     verify_prompt = (
-        f'Hindi text verification task.\n\n'
-        f'Original: "{prompt}"\n'
-        f'Proposed continuation: "{draft_continuation}"\n\n'
-        f'Does this continuation flow naturally? Reply ONLY:\n'
-        f'ACCEPT: <continuation>\nor\nREJECT: <better continuation>'
-    )
+    f'Strictly evaluate this Hindi continuation.\n\n'
+    f'Prompt: "{prompt}"\n'
+    f'Continuation: "{draft_continuation}"\n\n'
+    f'REJECT if: factually wrong, grammatically broken, '
+    f'topic drift, or unnatural register.\n'
+    f'Reply ONLY: ACCEPT: <text> or REJECT: <reason>'
+)
 
     t1 = time.perf_counter()
     try:
