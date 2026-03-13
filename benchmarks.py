@@ -146,36 +146,28 @@ def sarvam_chat(prompt, model, api_key, max_tokens=40):
 
 
 def sarvam_batch_verify(pairs, model, api_key, max_tokens=200):
-    """
-    Verify multiple (prompt, continuation) pairs in one API call.
-
-    Returns (accepted_list, raw_response).
-    accepted_list[i] = True if pair i was accepted.
-
-    Batch verification reduces per-prompt API cost by ~batch_size.
-    At batch_size=5: effective api_ms drops from ~1148ms to ~230ms per prompt.
-    """
     numbered = "\n".join(
-        f'{i+1}. Prompt: "{p}" | Continuation: "{c}"'
+        f'{i+1}. [{p}] → [{c}]'
         for i, (p, c) in enumerate(pairs)
     )
     verify_prompt = (
-        f"Strictly evaluate each Hindi continuation.\n\n"
+        f"You are evaluating speculative decoding drafts.\n"
+        f"Each item shows a Hindi prompt and the model's next few predicted tokens.\n"
+        f"These are partial continuations, not complete sentences.\n\n"
         f"{numbered}\n\n"
-        f"REJECT if: factually wrong, grammatically broken, topic drift, "
-        f"or unnatural register.\n\n"
-        f"Reply ONLY in this exact format:\n"
-        f"1: ACCEPT\n2: REJECT\n(one line per item, nothing else)"
+        f"ACCEPT if the tokens are a natural next continuation.\n"
+        f"REJECT only if the tokens are clearly wrong or contradictory.\n\n"
+        f"Reply with one line per item, numbered. Example format:\n"
+        f"1: ACCEPT\n"
+        f"2: ACCEPT\n"
+        f"3: REJECT\n"
+        f"Output ALL {len(pairs)} lines."
     )
-    raw = _post({
-        "model": model,
-        "messages": [{"role": "user", "content": verify_prompt}],
-        "temperature": 0.1,
-        "max_tokens": max_tokens,
-        "reasoning_effort": None,
-    }, api_key)
 
-    results = [False] * len(pairs)
+    raw = _post({...}, api_key)
+
+    # default ACCEPT — reject only on explicit REJECT
+    results = [True] * len(pairs)
     for line in raw.splitlines():
         line = line.strip()
         if ":" not in line:
@@ -184,7 +176,7 @@ def sarvam_batch_verify(pairs, model, api_key, max_tokens=200):
         try:
             idx = int(idx_str.strip()) - 1
             if 0 <= idx < len(results):
-                results[idx] = verdict.strip().upper().startswith("ACCEPT")
+                results[idx] = not verdict.strip().upper().startswith("REJECT")
         except ValueError:
             continue
     return results, raw
