@@ -176,7 +176,7 @@ def generate_draft(prompt, K, model, tokenizer, device):
     return text, ms
 
 def speedup(alpha, draft_per_token_ms, api_ms):
-    expected = draft_per_token_ms + (1 - alpha) * api_ms
+    expected = alpha * draft_per_token_ms + (1 - alpha) * api_ms
     return api_ms / expected
 
 def run_benchmark(prompts, k_values, model, tokenizer, device,
