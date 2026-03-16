@@ -91,7 +91,6 @@ def _post(payload, api_key, timeout=45):
 
 
 def sarvam_chat(prompt, model, api_key, max_tokens=40):
-    """Single-prompt API call. Used for the startup test only."""
     return _post({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
