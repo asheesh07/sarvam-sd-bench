@@ -23,7 +23,7 @@ Expected latency    = 126ms vs 228ms per token
 
 ### Benchmark Table
 
-| K  | α overall | Speedup | α general | α technical (10 prompts) | α mixed |
+| K  | α overall | Speedup | α general | α technical  | α mixed |
 |----|-----------|---------|-----------|--------------------------|---------|
 | 1  | 0.73      | 1.80×   | 0.70      | 1.00                     | 0.50    |
 | 3  | 0.60      | 1.58×   | 0.30      | 1.00                     | 0.50    |
